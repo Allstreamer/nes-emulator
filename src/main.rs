@@ -120,16 +120,16 @@ impl CPU {
 
     fn update_zero_and_negative_flags(&mut self, result: u8) {
         self.flag_zero = result == 0;
-        self.flag_negative = result > 127;
+        self.flag_negative = (result & 0b1000_0000) != 0;
     }
 
     fn push(&mut self, value: u8) {
         self.write(0x100 + self.stack_pointer as u16, value);
-        self.stack_pointer -= 1;
+        self.stack_pointer = self.stack_pointer.wrapping_sub(1);
     }
 
     fn pull(&mut self) -> u8 {
-        self.stack_pointer += 1;
+        self.stack_pointer = self.stack_pointer.wrapping_add(1);
         self.read(0x100 + self.stack_pointer as u16)
     }
 
@@ -190,6 +190,11 @@ impl CPU {
             }
             // BPL
             0x10 => self.branch_if(!self.flag_negative),
+            // CLC
+            0x18 => {
+                self.flag_carry = false;
+                self.current_step_cycles += 1;
+            }
 
             // JSR
             0x20 => {
@@ -206,11 +211,17 @@ impl CPU {
                 let status = self.pull();
                 self.set_status_from_byte(status);
 
-                self.current_step_cycles += 2;
+                self.current_step_cycles += 3;
             }
 
             // BMI
             0x30 => self.branch_if(self.flag_negative),
+
+            // SEC
+            0x38 => {
+                self.flag_carry = true;
+                self.current_step_cycles += 1;
+            }
 
             // PHA
             0x48 => {
@@ -218,8 +229,22 @@ impl CPU {
                 self.current_step_cycles += 2;
             }
 
+            // JMP
+            0x4C => {
+                let jmp_low = self.read_from_and_advance_pc();
+                let jmp_high = self.read(self.program_counter);
+                self.program_counter = ((jmp_high as u16) << 8) | jmp_low as u16;
+                self.current_step_cycles += 2;
+            }
+
             // BVC (Overflow Clear)
             0x50 => self.branch_if(!self.flag_overflow),
+            // CLI
+            0x58 => {
+                // Delay by one cycle
+                self.flag_interrupt_disable = false;
+                self.current_step_cycles += 1;
+            }
 
             // RTS
             0x60 => {
@@ -241,6 +266,12 @@ impl CPU {
 
             // BVS (Overflow Set)
             0x70 => self.branch_if(self.flag_overflow),
+            // SEI
+            0x78 => {
+                // Needs to be delayed by 1 cycle?
+                self.flag_interrupt_disable = true;
+                self.current_step_cycles += 1;
+            }
             // STY Zero Page
             0x84 => {
                 let write_addr = self.read_from_and_advance_pc();
@@ -265,15 +296,16 @@ impl CPU {
                 self.write(write_addr as u16, self.x_reg);
                 self.current_step_cycles += 1;
             }
-            // STX Absoulute
-            0x8E => {
-                let lower_addr = self.read_from_and_advance_pc();
+            // DEY
+            0x88 => {
+                self.y_reg = self.y_reg.wrapping_sub(1);
+                self.update_zero_and_negative_flags(self.y_reg);
                 self.current_step_cycles += 1;
-
-                let upper_addr = self.read_from_and_advance_pc();
-                self.current_step_cycles += 1;
-
-                self.write(((upper_addr as u16) << 8) | lower_addr as u16, self.x_reg);
+            }
+            // TXA
+            0x8A => {
+                self.a_reg = self.x_reg;
+                self.update_zero_and_negative_flags(self.a_reg);
                 self.current_step_cycles += 1;
             }
             // STY Absoulute
@@ -298,8 +330,30 @@ impl CPU {
                 self.write(((upper_addr as u16) << 8) | lower_addr as u16, self.a_reg);
                 self.current_step_cycles += 1;
             }
+            // STX Absoulute
+            0x8E => {
+                let lower_addr = self.read_from_and_advance_pc();
+                self.current_step_cycles += 1;
+
+                let upper_addr = self.read_from_and_advance_pc();
+                self.current_step_cycles += 1;
+
+                self.write(((upper_addr as u16) << 8) | lower_addr as u16, self.x_reg);
+                self.current_step_cycles += 1;
+            }
             // BCC
             0x90 => self.branch_if(!self.flag_carry),
+            // TYA
+            0x98 => {
+                self.a_reg = self.y_reg;
+                self.update_zero_and_negative_flags(self.a_reg);
+                self.current_step_cycles += 1;
+            }
+            // TXS
+            0x9A => {
+                self.stack_pointer = self.x_reg;
+                self.current_step_cycles += 1;
+            }
             // LDY Imm
             0xA0 => {
                 let result = self.read_from_and_advance_pc();
@@ -342,6 +396,12 @@ impl CPU {
                 self.a_reg = result;
                 self.update_zero_and_negative_flags(result);
             }
+            // TAY
+            0xA8 => {
+                self.y_reg = self.a_reg;
+                self.update_zero_and_negative_flags(self.y_reg);
+                self.current_step_cycles += 1;
+            }
             // LDA Imm
             0xA9 => {
                 let result = self.read_from_and_advance_pc();
@@ -350,21 +410,70 @@ impl CPU {
                 self.a_reg = result;
                 self.update_zero_and_negative_flags(result);
             }
+            // TAX
+            0xAA => {
+                self.x_reg = self.a_reg;
+                self.update_zero_and_negative_flags(self.x_reg);
+                self.current_step_cycles += 1;
+            }
             // BCS
             0xB0 => self.branch_if(self.flag_carry),
+            // CLV
+            0xB8 => {
+                self.flag_overflow = false;
+                self.current_step_cycles += 1;
+            }
+            // TSX
+            0xBA => {
+                self.x_reg = self.stack_pointer;
+                self.update_zero_and_negative_flags(self.x_reg);
+                self.current_step_cycles += 1;
+            }
+            // INY
+            0xC8 => {
+                self.y_reg = self.y_reg.wrapping_add(1);
+                self.update_zero_and_negative_flags(self.y_reg);
+                self.current_step_cycles += 1;
+            }
+            // DEX
+            0xCA => {
+                self.x_reg = self.x_reg.wrapping_sub(1);
+                self.update_zero_and_negative_flags(self.x_reg);
+                self.current_step_cycles += 1;
+            }
             // BNE
             0xD0 => self.branch_if(!self.flag_zero),
+            // CLD
+            0xD8 => {
+                self.flag_decimal = false;
+                self.current_step_cycles += 1;
+            }
+            // INX
+            0xE8 => {
+                self.x_reg = self.x_reg.wrapping_add(1);
+                self.update_zero_and_negative_flags(self.x_reg);
+                self.current_step_cycles += 1;
+            }
+            // NOP
+            0xEA => {
+                self.current_step_cycles += 1;
+            }
             // BEQ
             0xF0 => self.branch_if(self.flag_zero),
+            // SED
+            0xF8 => {
+                self.flag_decimal = true;
+                self.current_step_cycles += 1;
+            }
             _ => {
-                todo!("Unimplemented op_code: {}", op_code);
+                todo!("Unimplemented op_code: ${:02x}", op_code);
             }
         }
     }
 }
 
 fn main() {
-    let raw_rom = include_bytes!("../TestRoms/4_TheStack.nes");
+    let raw_rom = include_bytes!("../TestRoms/5_Instructions1.nes");
     let mut cpu = CPU::new();
     cpu.reset(raw_rom);
     println!("Starting PC: ${:x}", cpu.program_counter);
