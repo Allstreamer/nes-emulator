@@ -8,6 +8,7 @@ pub struct Cpu {
     pub a_reg: u8,
     pub x_reg: u8,
     pub y_reg: u8,
+    pub address_bus: u16,
 
     pub flag_carry: bool,
     pub flag_zero: bool,
@@ -33,6 +34,7 @@ impl Cpu {
             a_reg: 0,
             x_reg: 0,
             y_reg: 0,
+            address_bus: 0,
 
             flag_carry: false,
             flag_zero: false,
@@ -48,7 +50,7 @@ impl Cpu {
     }
 
     pub fn reset(&mut self, rom_file: &[u8]) {
-        self.cycles = 4;
+        self.cycles = 7;
 
         // Clear ram
         self.ram = [0; 0x800];
@@ -177,12 +179,98 @@ impl Cpu {
         self.flag_negative = (status & (1 << 7)) != 0;
     }
 
+    fn rol_raw(&mut self, mut input: u8) -> u8 {
+        let next_carry = input >= 0x80;
+        input <<= 1;
+        if self.flag_carry {
+            input |= 1;
+        }
+        self.flag_carry = next_carry;
+        self.flag_negative = input >= 0x80;
+        self.flag_zero = input == 0;
+        input
+    }
+
+    fn rol_value(&mut self, address: u16, mut input: u8) {
+        input = self.rol_raw(input);
+        self.write(address, input);
+    }
+
+    fn ror_raw(&mut self, mut input: u8) -> u8 {
+        let next_carry = (input & 1) != 0;
+
+        input >>= 1;
+
+        if self.flag_carry {
+            input |= 0b1000_0000;
+        }
+
+        self.flag_carry = next_carry;
+        self.flag_negative = (input & 0b1000_0000) != 0;
+        self.flag_zero = input == 0;
+
+        input
+    }
+
+    fn ror_value(&mut self, address: u16, mut input: u8) {
+        input = self.ror_raw(input);
+        self.write(address, input);
+    }
+
+    fn lsr_raw(&mut self, mut input: u8) -> u8 {
+        self.flag_carry = (input & 1) != 0;
+
+        input >>= 1;
+
+        self.flag_negative = false;
+        self.flag_zero = input == 0;
+
+        input
+    }
+
+    fn lsr_value(&mut self, address: u16, mut input: u8) {
+        input = self.lsr_raw(input);
+        self.write(address, input);
+    }
+
+    fn read_zero_page_addr(&mut self) {
+        let lower_addr = self.read_from_and_advance_pc();
+        self.current_step_cycles += 1;
+
+        self.address_bus = lower_addr as u16;
+    }
+
+    fn read_absolute_addr(&mut self) {
+        let low_byte = self.read_from_and_advance_pc();
+        self.current_step_cycles += 1;
+
+        let high_byte = self.read_from_and_advance_pc();
+        self.current_step_cycles += 1;
+
+        self.address_bus = ((high_byte as u16) << 8) | low_byte as u16;
+    }
+
     pub fn step(&mut self) {
-        let mut debug_string = String::new();
+        let pre_step_pc = self.program_counter;
 
         let op_code = self.read_from_and_advance_pc();
         // Take one cycle to read
         self.current_step_cycles = 1;
+
+        let mut debug_string = String::new();
+        debug_string.push_str(&format!("{:04x} ", pre_step_pc));
+        debug_string.push_str(&format!("{:02x} ", op_code));
+        debug_string.push_str(OPCODE_NAMES[op_code as usize]);
+        debug_string.push_str(&format!(
+            "\tA: {:02x} X:{:02x} Y:{:02x} P:{:02x} SP:{:02x}\tCycle: {}",
+            self.a_reg,
+            self.x_reg,
+            self.y_reg,
+            self.status_as_bytes(false),
+            self.stack_pointer,
+            self.cycles
+        ));
+        println!("{}", debug_string);
 
         match op_code {
             // HLT
@@ -203,18 +291,16 @@ impl Cpu {
             }
             // ASL Absoulute
             0x0E => {
-                let low_byte = self.read_from_and_advance_pc();
-                let high_byte = self.read_from_and_advance_pc();
-                let address = ((high_byte as u16) << 8) | low_byte as u16;
-                let mut mem_value = self.read(address);
+                self.read_absolute_addr();
+                let mut mem_value = self.read(self.address_bus);
 
                 self.flag_carry = mem_value > 127;
                 mem_value <<= 1;
 
-                self.write(address, mem_value);
+                self.write(self.address_bus, mem_value);
                 self.update_zero_and_negative_flags(mem_value);
 
-                self.current_step_cycles += 5;
+                self.current_step_cycles += 3;
             }
             // BPL
             0x10 => self.branch_if(!self.flag_negative),
@@ -234,11 +320,31 @@ impl Cpu {
                 self.current_step_cycles += 5;
             }
 
+            // ROL Zero Page
+            0x26 => {
+                self.read_zero_page_addr();
+                self.rol_value(self.address_bus, self.read(self.address_bus));
+                self.current_step_cycles += 3;
+            }
+
             // PLP
             0x28 => {
                 let status = self.pull();
                 self.set_status_from_byte(status);
 
+                self.current_step_cycles += 3;
+            }
+
+            // ROL A
+            0x2A => {
+                self.a_reg = self.rol_raw(self.a_reg);
+                self.current_step_cycles += 1;
+            }
+
+            // ROL Absoulute
+            0x2E => {
+                self.read_absolute_addr();
+                self.rol_value(self.address_bus, self.read(self.address_bus));
                 self.current_step_cycles += 3;
             }
 
@@ -251,18 +357,34 @@ impl Cpu {
                 self.current_step_cycles += 1;
             }
 
+            // LSR Zero Page
+            0x46 => {
+                self.read_zero_page_addr();
+                self.lsr_value(self.address_bus, self.read(self.address_bus));
+                self.current_step_cycles += 3;
+            }
             // PHA
             0x48 => {
                 self.push(self.a_reg);
                 self.current_step_cycles += 2;
             }
+            // LSR A
+            0x4A => {
+                self.a_reg = self.lsr_raw(self.a_reg);
+                self.current_step_cycles += 1;
+            }
 
-            // JMP
+            // JMP Absoulute
             0x4C => {
-                let jmp_low = self.read_from_and_advance_pc();
-                let jmp_high = self.read(self.program_counter);
-                self.program_counter = ((jmp_high as u16) << 8) | jmp_low as u16;
-                self.current_step_cycles += 2;
+                self.read_absolute_addr();
+                self.program_counter = self.address_bus;
+            }
+
+            // LSR Absoulute
+            0x4E => {
+                self.read_absolute_addr();
+                self.lsr_value(self.address_bus, self.read(self.address_bus));
+                self.current_step_cycles += 3;
             }
 
             // BVC (Overflow Clear)
@@ -283,12 +405,32 @@ impl Cpu {
                 self.current_step_cycles += 5;
             }
 
+            // ROR Zero Page
+            0x66 => {
+                self.read_zero_page_addr();
+                self.ror_value(self.address_bus, self.read(self.address_bus));
+                self.current_step_cycles += 3;
+            }
+
             // PLA
             0x68 => {
                 let result = self.pull();
                 self.a_reg = result;
                 self.update_zero_and_negative_flags(result);
 
+                self.current_step_cycles += 3;
+            }
+
+            // ROR A
+            0x6A => {
+                self.a_reg = self.ror_raw(self.a_reg);
+                self.current_step_cycles += 1;
+            }
+
+            // ROR Absoulute
+            0x6E => {
+                self.read_absolute_addr();
+                self.ror_value(self.address_bus, self.read(self.address_bus));
                 self.current_step_cycles += 3;
             }
 
@@ -302,26 +444,23 @@ impl Cpu {
             }
             // STY Zero Page
             0x84 => {
-                let write_addr = self.read_from_and_advance_pc();
-                self.current_step_cycles += 1;
+                self.read_zero_page_addr();
 
-                self.write(write_addr as u16, self.y_reg);
+                self.write(self.address_bus, self.y_reg);
                 self.current_step_cycles += 1;
             }
             // STA Zero Page
             0x85 => {
-                let write_addr = self.read_from_and_advance_pc();
-                self.current_step_cycles += 1;
+                self.read_zero_page_addr();
 
-                self.write(write_addr as u16, self.a_reg);
+                self.write(self.address_bus, self.a_reg);
                 self.current_step_cycles += 1;
             }
             // STX Zero Page
             0x86 => {
-                let write_addr = self.read_from_and_advance_pc();
-                self.current_step_cycles += 1;
+                self.read_zero_page_addr();
 
-                self.write(write_addr as u16, self.x_reg);
+                self.write(self.address_bus, self.x_reg);
                 self.current_step_cycles += 1;
             }
             // DEY
@@ -338,35 +477,20 @@ impl Cpu {
             }
             // STY Absoulute
             0x8C => {
-                let lower_addr = self.read_from_and_advance_pc();
-                self.current_step_cycles += 1;
-
-                let upper_addr = self.read_from_and_advance_pc();
-                self.current_step_cycles += 1;
-
-                self.write(((upper_addr as u16) << 8) | lower_addr as u16, self.y_reg);
+                self.read_absolute_addr();
+                self.write(self.address_bus, self.y_reg);
                 self.current_step_cycles += 1;
             }
             // STA Absoulute
             0x8D => {
-                let lower_addr = self.read_from_and_advance_pc();
-                self.current_step_cycles += 1;
-
-                let upper_addr = self.read_from_and_advance_pc();
-                self.current_step_cycles += 1;
-
-                self.write(((upper_addr as u16) << 8) | lower_addr as u16, self.a_reg);
+                self.read_absolute_addr();
+                self.write(self.address_bus, self.a_reg);
                 self.current_step_cycles += 1;
             }
             // STX Absoulute
             0x8E => {
-                let lower_addr = self.read_from_and_advance_pc();
-                self.current_step_cycles += 1;
-
-                let upper_addr = self.read_from_and_advance_pc();
-                self.current_step_cycles += 1;
-
-                self.write(((upper_addr as u16) << 8) | lower_addr as u16, self.x_reg);
+                self.read_absolute_addr();
+                self.write(self.address_bus, self.x_reg);
                 self.current_step_cycles += 1;
             }
             // BCC
@@ -400,10 +524,9 @@ impl Cpu {
             }
             // LDA Zero Page
             0xA5 => {
-                let read_addr = self.read_from_and_advance_pc();
-                self.current_step_cycles += 1;
+                self.read_zero_page_addr();
 
-                let result = self.read(read_addr as u16);
+                let result = self.read(self.address_bus);
                 self.current_step_cycles += 1;
 
                 self.a_reg = result;
@@ -411,18 +534,12 @@ impl Cpu {
             }
             // LDA Absoulute
             0xAD => {
-                let lower_addr = self.read_from_and_advance_pc();
-                self.current_step_cycles += 1;
-
-                let upper_addr = self.read_from_and_advance_pc();
-                self.current_step_cycles += 1;
-
-                let addr = ((upper_addr as u16) << 8) | lower_addr as u16;
-                let result = self.read(addr);
-                self.current_step_cycles += 1;
+                self.read_absolute_addr();
+                let result = self.read(self.address_bus);
 
                 self.a_reg = result;
                 self.update_zero_and_negative_flags(result);
+                self.current_step_cycles += 1;
             }
             // TAY
             0xA8 => {
@@ -498,20 +615,6 @@ impl Cpu {
             }
         }
         self.cycles += self.current_step_cycles;
-
-        debug_string.push_str(&format!("{:04x} ", self.program_counter));
-        debug_string.push_str(&format!("{:02x} ", op_code));
-        debug_string.push_str(OPCODE_NAMES[op_code as usize]);
-        debug_string.push_str(&format!(
-            "\tA: {:02x} X:{:02x} Y:{:02x} P:{:02x} SP:{:02x}\tCycle: {}",
-            self.a_reg,
-            self.x_reg,
-            self.y_reg,
-            self.status_as_bytes(false),
-            self.stack_pointer,
-            self.cycles
-        ));
-        println!("{}", debug_string);
     }
 }
 
